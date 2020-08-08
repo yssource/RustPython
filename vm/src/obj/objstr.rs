@@ -18,6 +18,8 @@ use super::objint::{PyInt, PyIntRef};
 use super::objiter;
 use super::objsequence::{PySliceableSequence, SequenceIndex};
 use super::objtype::{self, PyClassRef};
+use crate::common::cell::OnceCell;
+use crate::common::rc::PyRc;
 use crate::exceptions::IntoPyException;
 use crate::format::{FormatSpec, FormatString, FromTemplate};
 use crate::function::{OptionalArg, OptionalOption, PyFuncArgs};
@@ -43,23 +45,107 @@ use rustpython_common::hash;
 /// errors defaults to 'strict'."
 #[pyclass(module = false, name = "str")]
 #[derive(Debug)]
-pub struct PyString {
-    value: String,
-    hash: AtomicCell<Option<hash::PyHash>>,
-    len: AtomicCell<Option<usize>>,
+pub struct PyString(PyRc<PyStringDataType>);
+
+#[derive(Debug)]
+struct PyStringDataType {
+    data: rustpython_common::str::StrData,
+    hash: OnceCell<hash::PyHash>,
+    utf8: OnceCell<PyStringUtf8Repr>,
 }
 
-impl<'a> BorrowValue<'a> for PyString {
-    type Borrowed = &'a str;
+#[derive(Debug)]
+enum PyStringUtf8Repr {
+    Invalid {
+        err: PyUtf8Error,
+        lossy: OnceCell<PyBytesRef>,
+    },
+    Valid {
+        utf8: Option<PyBytesRef>,
+    },
+}
 
-    fn borrow_value(&'a self) -> Self::Borrowed {
-        &self.value
+impl PyStringDataType {
+    fn to_utf8_lossy(&self, vm: &VirtualMachine) -> &PyBytesRef {
+        let repr = self.utf8.get_or_init(|| {
+            let mut err = None;
+            let s = self
+                .data
+                .iter()
+                .enumerate()
+                .map(|(i, ucs)| {
+                    std::char::from_u32(ucs).unwrap_or_else(|| {
+                        if err.is_none() {
+                            err = Some(PyUtf8Error { position: i });
+                        }
+                        std::char::REPLACEMENT_CHARACTER
+                    })
+                })
+                .collect::<String>();
+            let bytes = PyBytes::from(s.into_bytes()).into_ref(vm);
+
+            match err {
+                Some(err) => PyStringUtf8Repr::Invalid {
+                    err,
+                    lossy: bytes.into(),
+                },
+                None => PyStringUtf8Repr::Valid { utf8: bytes },
+            }
+        });
+        match repr {
+            PyStringUtf8Repr::Invalid { lossy, .. } => lossy.get_or_init(|| {
+                let s = self
+                    .data
+                    .iter()
+                    .map(|ucs| std::char::from_u32(ucs).unwrap_or(std::char::REPLACEMENT_CHARACTER))
+                    .collect::<String>();
+                PyBytes::from(s.into_bytes()).into_ref(vm)
+            }),
+            PyStringUtf8Repr::Valid { utf8 } => utf8,
+        }
+    }
+    fn to_str(&self, vm: &VirtualMachine) -> Result<&PyBytesRef, PyUtf8Error> {
+        let repr = self.utf8.get_or_init(|| {
+            let res = self
+                .data
+                .iter()
+                .enumerate()
+                .map(|(i, ucs)| std::char::from_u32(ucs).ok_or(PyUtf8Error { position: i }))
+                .collect::<Result<String, _>>();
+            match res {
+                Ok(s) => PyStringUtf8Repr::Valid {
+                    utf8: PyBytes::from(s.into_bytes()).into_ref(vm).into(),
+                },
+                Err(err) => PyStringUtf8Repr::Invalid {
+                    err,
+                    lossy: OnceCell::new(),
+                },
+            }
+        });
+        match repr {
+            PyStringUtf8Repr::Valid { utf8 } => Ok(utf8),
+            PyStringUtf8Repr::Invalid { err, .. } => Err(err.clone()),
+        }
     }
 }
 
-impl AsRef<str> for PyString {
-    fn as_ref(&self) -> &str {
-        &self.value
+#[derive(Debug, Clone)]
+pub struct PyUtf8Error {
+    position: usize,
+}
+
+// impl<'a> BorrowValue<'a> for PyString {
+//     type Borrowed = &'a str;
+
+//     fn borrow_value(&'a self) -> Self::Borrowed {
+//         &self.value
+//     }
+// }
+
+impl PyString {
+    #[inline]
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
     }
 }
 
@@ -74,11 +160,7 @@ where
 
 impl From<String> for PyString {
     fn from(s: String) -> PyString {
-        PyString {
-            value: s,
-            hash: AtomicCell::default(),
-            len: AtomicCell::default(),
-        }
+        Self(PyRc::new(s.into()))
     }
 }
 
@@ -291,21 +373,14 @@ impl PyString {
 
     #[pymethod(name = "__hash__")]
     pub(crate) fn hash(&self) -> hash::PyHash {
-        self.hash.load().unwrap_or_else(|| {
-            let hash = hash::hash_str(&self.value);
-            self.hash.store(Some(hash));
-            hash
-        })
+        // TODO: hash
+        // self.hash.get_or_init(|| self..hash()
     }
 
     #[pymethod(name = "__len__")]
     #[inline]
     fn len(&self) -> usize {
-        self.len.load().unwrap_or_else(|| {
-            let len = self.value.chars().count();
-            self.len.store(Some(len));
-            len
-        })
+        self.0.len()
     }
 
     #[pymethod(name = "__sizeof__")]

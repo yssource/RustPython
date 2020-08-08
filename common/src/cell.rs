@@ -13,6 +13,14 @@ use std::ops::{Deref, DerefMut};
 
 cfg_if::cfg_if! {
     if #[cfg(feature = "threading")] {
+        pub use once_cell::sync::OnceCell;
+    } else {
+        pub use once_cell::unsync::OnceCell;
+    }
+}
+
+cfg_if::cfg_if! {
+    if #[cfg(feature = "threading")] {
         type MutexInner<T> = Mutex<T>;
         type MutexGuardInner<'a, T> = MutexGuard<'a, T>;
         const fn new_mutex<T>(value: T) -> MutexInner<T> {
