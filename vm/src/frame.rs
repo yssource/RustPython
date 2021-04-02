@@ -367,13 +367,19 @@ impl ExecutingFrame<'_> {
         }
     }
 
+    #[inline(always)]
+    fn fetch_next_instr(&mut self) -> usize {
+        let idx = self.lasti() as usize;
+        self.update_lasti(|i| *i += 1);
+        idx
+    }
+
     fn run(&mut self, vm: &VirtualMachine) -> PyResult<ExecutionResult> {
         flame_guard!(format!("Frame::run({})", self.code.obj_name));
         // Execute until return or exception:
         let instrs = &self.code.instructions;
         loop {
-            let idx = self.lasti() as usize;
-            self.update_lasti(|i| *i += 1);
+            let idx = self.fetch_next_instr();
             let instr = &instrs[idx];
             let result = self.execute_instruction(instr, vm);
             match result {
@@ -510,26 +516,59 @@ impl ExecutingFrame<'_> {
             trace!("=======");
         }
 
-        macro_rules! fn_dispatch {
-            (args($dT:ty => $retT:ty ,$arg1:ident: $argT1:ty, $arg2:ident: $argT2:ty), match ($d:expr) { $($p:pat => $body:block)* }) => {{
-                let f = match $d {
-                    $($p => {
-                        fn match_arm(x: $dT, #[allow(unused)] $arg1: $argT1, #[allow(unused)] $arg2: $argT2) -> $retT {
-                            match x {
-                                $p => $body
-                                _ => unsafe { std::hint::unreachable_unchecked() }
+        macro_rules! get_instr_fn_ptr {
+            (fn($insT:ty, $arg1:ident: $arg1T:ty, $arg2:ident: $arg2T:ty$(,)?) -> $retT:ty, match ($ins:expr) { $($p:pat => $body:block)* }) => {{
+                #[inline(always)]
+                fn get_fn(ins: $insT) -> fn($insT, $arg1T, $arg2T) -> $retT {
+                    #[allow(unused)]
+                    match ins {
+                        $($p => {
+                            fn match_arm(x: $insT, $arg1: $arg1T, $arg2: $arg2T) -> $retT {
+                                let ret = (|| match x {
+                                    $p => $body
+                                    _ => unsafe { std::hint::unreachable_unchecked() }
+                                })();
+                                match ret {
+                                    Ok(None) => {
+                                        drop(ret);
+                                        let idx = $arg1.fetch_next_instr();
+                                        $arg2.check_signals()?;
+                                        let ins = &$arg1.code.instructions[idx];
+                                        get_fn(ins)(ins, $arg1, $arg2)
+                                    }
+                                    x => x
+                                }
                             }
-                        }
-                        match_arm as fn($dT, $argT1, $argT2) -> $retT
-                    })*
-                };
-                f($d, $arg1, $arg2)
+                            match_arm as _
+                        })*
+                    }
+                }
+                get_fn($ins)
             }}
         }
 
         let zelf = self;
-        fn_dispatch!(args(&bytecode::Instruction => FrameResult, zelf: &mut ExecutingFrame, vm: &VirtualMachine),
-        match (instruction) {
+
+        macro_rules! fn_dispatch {
+            (match ($ins:expr, &mut *$z:ident, $v:ident).0 { $($p:pat => $body:block)* }) => {{
+                let f = get_instr_fn_ptr!(
+                    fn(
+                        &bytecode::Instruction,
+                        $z: &mut ExecutingFrame,
+                        $v: &VirtualMachine,
+                    ) -> FrameResult,
+                    match ($ins) { $($p => $body)* }
+                );
+                f($ins, zelf, vm)
+            }};
+        }
+        // macro_rules! fn_dispatch {
+        //     ($e:expr) => {
+        //         $e
+        //     };
+        // }
+
+        fn_dispatch!(match (instruction, &mut *zelf, vm).0 {
             bytecode::Instruction::LoadConst { idx } => {
                 zelf.push_value(zelf.code.constants[*idx as usize].0.clone());
                 Ok(None)
@@ -537,8 +576,12 @@ impl ExecutingFrame<'_> {
             bytecode::Instruction::ImportName { idx } => {
                 zelf.import(vm, Some(zelf.code.names[*idx as usize].clone()))
             }
-            bytecode::Instruction::ImportNameless => { zelf.import(vm, None) }
-            bytecode::Instruction::ImportStar => { zelf.import_star(vm) }
+            bytecode::Instruction::ImportNameless => {
+                zelf.import(vm, None)
+            }
+            bytecode::Instruction::ImportStar => {
+                zelf.import_star(vm)
+            }
             bytecode::Instruction::ImportFrom { idx } => {
                 let obj = zelf.import_from(vm, *idx)?;
                 zelf.push_value(obj);
@@ -652,9 +695,15 @@ impl ExecutingFrame<'_> {
                 zelf.push_value(value.into_object());
                 Ok(None)
             }
-            bytecode::Instruction::Subscript => { zelf.execute_subscript(vm) }
-            bytecode::Instruction::StoreSubscript => { zelf.execute_store_subscript(vm) }
-            bytecode::Instruction::DeleteSubscript => { zelf.execute_delete_subscript(vm) }
+            bytecode::Instruction::Subscript => {
+                zelf.execute_subscript(vm)
+            }
+            bytecode::Instruction::StoreSubscript => {
+                zelf.execute_store_subscript(vm)
+            }
+            bytecode::Instruction::DeleteSubscript => {
+                zelf.execute_delete_subscript(vm)
+            }
             bytecode::Instruction::Pop => {
                 // Pop value from stack and ignore.
                 zelf.pop_value();
@@ -667,7 +716,9 @@ impl ExecutingFrame<'_> {
                 zelf.push_value(value);
                 Ok(None)
             }
-            bytecode::Instruction::Rotate { amount } => { zelf.execute_rotate(*amount) }
+            bytecode::Instruction::Rotate { amount } => {
+                zelf.execute_rotate(*amount)
+            }
             bytecode::Instruction::BuildString { size } => {
                 let s = zelf
                     .pop_multiple(*size as usize)
@@ -712,8 +763,12 @@ impl ExecutingFrame<'_> {
                 size,
                 unpack,
                 for_call,
-            } => { zelf.execute_build_map(vm, *size, *unpack, *for_call) }
-            bytecode::Instruction::BuildSlice { step } => { zelf.execute_build_slice(vm, *step) }
+            } => {
+                zelf.execute_build_map(vm, *size, *unpack, *for_call)
+            }
+            bytecode::Instruction::BuildSlice { step } => {
+                zelf.execute_build_slice(vm, *step)
+            }
             bytecode::Instruction::ListAppend { i } => {
                 let list_obj = zelf.nth_value(*i);
                 let item = zelf.pop_value();
@@ -741,15 +796,27 @@ impl ExecutingFrame<'_> {
                 PyDictRef::try_from_object(vm, dict_obj)?.set_item(key, value, vm)?;
                 Ok(None)
             }
-            bytecode::Instruction::BinaryOperation { op } => { zelf.execute_binop(vm, *op) }
+            bytecode::Instruction::BinaryOperation { op } => {
+                zelf.execute_binop(vm, *op)
+            }
             bytecode::Instruction::BinaryOperationInplace { op } => {
                 zelf.execute_binop_inplace(vm, *op)
             }
-            bytecode::Instruction::LoadAttr { idx } => { zelf.load_attr(vm, *idx) }
-            bytecode::Instruction::StoreAttr { idx } => { zelf.store_attr(vm, *idx) }
-            bytecode::Instruction::DeleteAttr { idx } => { zelf.delete_attr(vm, *idx) }
-            bytecode::Instruction::UnaryOperation { ref op } => { zelf.execute_unop(vm, op) }
-            bytecode::Instruction::CompareOperation { ref op } => { zelf.execute_compare(vm, op) }
+            bytecode::Instruction::LoadAttr { idx } => {
+                zelf.load_attr(vm, *idx)
+            }
+            bytecode::Instruction::StoreAttr { idx } => {
+                zelf.store_attr(vm, *idx)
+            }
+            bytecode::Instruction::DeleteAttr { idx } => {
+                zelf.delete_attr(vm, *idx)
+            }
+            bytecode::Instruction::UnaryOperation { ref op } => {
+                zelf.execute_unop(vm, op)
+            }
+            bytecode::Instruction::CompareOperation { ref op } => {
+                zelf.execute_compare(vm, op)
+            }
             bytecode::Instruction::ReturnValue => {
                 let value = zelf.pop_value();
                 zelf.unwind_blocks(vm, UnwindReason::Returning { value })
@@ -763,7 +830,9 @@ impl ExecutingFrame<'_> {
                 };
                 Ok(Some(ExecutionResult::Yield(value)))
             }
-            bytecode::Instruction::YieldFrom => { zelf.execute_yield_from(vm) }
+            bytecode::Instruction::YieldFrom => {
+                zelf.execute_yield_from(vm)
+            }
             bytecode::Instruction::SetupAnnotation => {
                 if !zelf.locals.contains_key("__annotations__", vm) {
                     zelf.locals
@@ -930,8 +999,12 @@ impl ExecutingFrame<'_> {
                     Err(exc.downcast().unwrap())
                 }
             }
-            bytecode::Instruction::ForIter { target } => { zelf.execute_for_iter(vm, *target) }
-            bytecode::Instruction::MakeFunction(flags) => { zelf.execute_make_function(vm, *flags) }
+            bytecode::Instruction::ForIter { target } => {
+                zelf.execute_for_iter(vm, *target)
+            }
+            bytecode::Instruction::MakeFunction(flags) => {
+                zelf.execute_make_function(vm, *flags)
+            }
             bytecode::Instruction::CallFunctionPositional { nargs } => {
                 let args = zelf.collect_positional_args(*nargs);
                 zelf.execute_call(args, vm)
@@ -1015,9 +1088,13 @@ impl ExecutingFrame<'_> {
                 Ok(None)
             }
 
-            bytecode::Instruction::Raise { kind } => { zelf.execute_raise(vm, *kind) }
+            bytecode::Instruction::Raise { kind } => {
+                zelf.execute_raise(vm, *kind)
+            }
 
-            bytecode::Instruction::Break => { zelf.unwind_blocks(vm, UnwindReason::Break) }
+            bytecode::Instruction::Break => {
+                zelf.unwind_blocks(vm, UnwindReason::Break)
+            }
             bytecode::Instruction::Continue { target } => {
                 zelf.unwind_blocks(vm, UnwindReason::Continue { target: *target })
             }
