@@ -19,7 +19,7 @@ use openssl::{
     error::ErrorStack,
     nid::Nid,
     ssl::{self, SslContextBuilder, SslOptions, SslVerifyMode},
-    x509::{self, X509Object, X509Ref, X509},
+    x509::{self, X509Ref, X509},
 };
 use std::convert::TryFrom;
 use std::ffi::{CStr, CString};
@@ -458,22 +458,22 @@ impl PySslContext {
         }
 
         if let Some(cadata) = args.cadata {
-            let cert = match cadata {
+            let certs = match cadata {
                 Either::A(s) => {
-                    if !s.as_str().is_ascii() {
+                    if !s.is_ascii() {
                         return Err(vm.new_type_error("Must be an ascii string".to_owned()));
                     }
-                    X509::from_pem(s.as_str().as_bytes())
+                    X509::stack_from_pem(s.as_str().as_bytes())
                 }
                 Either::B(b) => b.with_ref(X509::from_der),
             };
-            let cert = cert.map_err(|e| convert_openssl_error(vm, e))?;
-            let ret = self.exec_ctx(|ctx| {
-                let store = ctx.cert_store();
-                unsafe { sys::X509_STORE_add_cert(store.as_ptr(), cert.as_ptr()) }
-            });
-            if ret <= 0 {
-                return Err(convert_openssl_error(vm, ErrorStack::get()));
+            let certs = certs.map_err(|e| convert_openssl_error(vm, e))?;
+            let mut ctx = self.builder();
+            let store = ctx.cert_store_mut();
+            for cert in certs {
+                store
+                    .add_cert(cert)
+                    .map_err(|e| convert_openssl_error(vm, e))?;
             }
         }
 
@@ -506,22 +506,17 @@ impl PySslContext {
 
     #[pymethod]
     fn get_ca_certs(&self, binary_form: OptionalArg<bool>, vm: &VirtualMachine) -> PyResult {
-        use openssl::stack::StackRef;
         let binary_form = binary_form.unwrap_or(false);
-        let certs = unsafe {
-            let stack =
-                sys::X509_STORE_get0_objects(self.exec_ctx(|ctx| ctx.cert_store().as_ptr()));
-            assert!(!stack.is_null());
-            StackRef::<X509Object>::from_ptr(stack)
-        };
-        let certs = certs
-            .iter()
-            .filter_map(|cert| {
-                let cert = cert.x509()?;
-                Some(cert_to_py(vm, cert, binary_form))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(vm.ctx.new_list(certs))
+        self.exec_ctx(|ctx| {
+            let certs = ctx
+                .cert_store()
+                .objects()
+                .iter()
+                .filter_map(|obj| obj.x509())
+                .map(|cert| cert_to_py(vm, cert, binary_form))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(vm.ctx.new_list(certs))
+        })
     }
 
     #[pymethod]
